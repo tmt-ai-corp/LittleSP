@@ -160,6 +160,16 @@ CUDA_VISIBLE_DEVICES=0 python eval.py \
     --split_dim 1024
 ```
 
+### Speculative Prefill Drafter Training
+
+This repository also includes an experimental path for training a LittleBitLinear
+student as a prompt block scorer for Speculative Prefill. Instead of optimizing
+PPL/zero-shot metrics directly, it distills answer-conditioned target deletion
+utility from SFT data into the student's prompt-only block scores.
+
+See [docs/sprefill_experiment.md](docs/sprefill_experiment.md) for the SFT
+mixture, loss definition, training commands, and TTFT/retention evaluation.
+
 Parameter loading priority:
 
 1. Explicit CLI arguments

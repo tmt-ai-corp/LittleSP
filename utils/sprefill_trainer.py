@@ -57,6 +57,13 @@ class SpecPrefillKDTrainer(Trainer):
         self.loss_config = loss_config
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
+    @staticmethod
+    def _move_tensor_inputs(inputs: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+        return {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        }
+
     def _teacher_forward_for_kd(self, inputs: Dict[str, torch.Tensor], output_hidden_states: bool):
         teacher_device = get_model_device(self.teacher_model)
         teacher_inputs = {
@@ -79,6 +86,7 @@ class SpecPrefillKDTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         cfg = self.loss_config
+        inputs = self._move_tensor_inputs(inputs, get_model_device(model))
 
         teacher_utility, teacher_mask = teacher_deletion_utility(
             self.teacher_model,

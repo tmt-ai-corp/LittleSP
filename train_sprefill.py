@@ -127,6 +127,17 @@ def use_bf16(args) -> bool:
     return bool(args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
 
 
+def set_attention_implementation(model, implementation: str) -> None:
+    if hasattr(model, "set_attn_implementation"):
+        try:
+            model.set_attn_implementation(implementation)
+            return
+        except Exception:
+            pass
+    if hasattr(model, "config"):
+        model.config._attn_implementation = implementation
+
+
 def load_student_model(args, torch_dtype):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
@@ -136,6 +147,7 @@ def load_student_model(args, torch_dtype):
         trust_remote_code=True,
         attn_implementation=args.attn_implementation,
     )
+    set_attention_implementation(model, args.attn_implementation)
     model.config.use_cache = False
     model.config.output_attentions = True
     if args.gradient_checkpointing:

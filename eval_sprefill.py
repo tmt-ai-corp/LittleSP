@@ -49,6 +49,7 @@ def get_args():
     parser.add_argument("--drafter_fp_eval", type=str2bool, default=False)
     parser.add_argument("--torch_dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--device_map", type=str, default="auto")
+    parser.add_argument("--drafter_attn_implementation", type=str, default="eager")
 
     parser.add_argument("--sft_sources", nargs="+", default=DEFAULT_SFT_SOURCES)
     parser.add_argument("--prepared_sft_path", type=str, default=None)
@@ -94,6 +95,17 @@ def resolve_dtype(name: str):
     return torch.float32
 
 
+def set_attention_implementation(model, implementation: str) -> None:
+    if hasattr(model, "set_attn_implementation"):
+        try:
+            model.set_attn_implementation(implementation)
+            return
+        except Exception:
+            pass
+    if hasattr(model, "config"):
+        model.config._attn_implementation = implementation
+
+
 def load_drafter(args, dtype):
     if args.drafter_fp_eval:
         model = AutoModelForCausalLM.from_pretrained(
@@ -101,7 +113,7 @@ def load_drafter(args, dtype):
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
-            attn_implementation="eager",
+            attn_implementation=args.drafter_attn_implementation,
             device_map=args.device_map if args.device_map.lower() != "none" else None,
         )
     else:
@@ -110,6 +122,7 @@ def load_drafter(args, dtype):
             torch_dtype=dtype,
             device=args.device_map,
         )
+    set_attention_implementation(model, args.drafter_attn_implementation)
     model.eval()
     model.config.use_cache = False
     model.config.output_attentions = True

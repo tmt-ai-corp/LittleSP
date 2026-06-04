@@ -2,8 +2,9 @@ import argparse
 import json
 import math
 import os
+import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, Optional
 
 import torch
 from tqdm import tqdm
@@ -11,7 +12,12 @@ from transformers import AutoModelForCausalLM
 
 from quantization.hub import LittleBitModel
 from utils.datautils import load_tokenizer
-from utils.sprefill_data import DEFAULT_SFT_SOURCES, prepare_sprefill_sft_dataset
+from utils.sprefill_data import (
+    DEFAULT_SFT_SOURCES,
+    prepare_sprefill_sft_dataset,
+    render_prompt,
+    split_prompt_answer,
+)
 from utils.sprefill_losses import (
     aggregate_attention_block_scores,
     answer_nll,
@@ -71,6 +77,12 @@ def get_args():
     parser.add_argument("--retention_nll_delta_threshold", type=float, default=0.05)
     parser.add_argument("--output_jsonl", type=str, default="./sprefill_eval_records.jsonl")
     parser.add_argument("--output_summary", type=str, default="./sprefill_eval_summary.json")
+
+    parser.add_argument("--benchmark_jsonl", type=str, default=None)
+    parser.add_argument("--prompt_field", type=str, default="prompt")
+    parser.add_argument("--answer_field", type=str, default="answer")
+    parser.add_argument("--eval_generation", type=str2bool, default=False)
+    parser.add_argument("--generation_max_new_tokens", type=int, default=128)
     return parser.parse_args()
 
 
@@ -130,6 +142,96 @@ def _make_answer_batch(prompt_ids: torch.Tensor, answer_ids: torch.Tensor, devic
     return input_ids, attention, labels
 
 
+def _normalize_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def exact_match(prediction: str, reference: str) -> float:
+    return float(_normalize_text(prediction) == _normalize_text(reference))
+
+
+def contains_answer(prediction: str, reference: str) -> float:
+    pred = _normalize_text(prediction)
+    ref = _normalize_text(reference)
+    return float(bool(ref) and ref in pred)
+
+
+def token_f1(prediction: str, reference: str) -> float:
+    pred_tokens = _normalize_text(prediction).split()
+    ref_tokens = _normalize_text(reference).split()
+    if not pred_tokens or not ref_tokens:
+        return float(pred_tokens == ref_tokens)
+    common = {}
+    for token in pred_tokens:
+        common[token] = min(pred_tokens.count(token), ref_tokens.count(token))
+    overlap = sum(common.values())
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(ref_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def tokenize_plain_prompt_answer(prompt_text: str, answer_text: str, tokenizer, args) -> Dict:
+    prompt_ids = tokenizer(
+        prompt_text,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=args.max_prompt_tokens,
+    )["input_ids"]
+    answer_ids = tokenizer(
+        answer_text,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=args.max_answer_tokens,
+    )["input_ids"]
+    if args.add_eos_to_answer and tokenizer.eos_token_id is not None:
+        if not answer_ids or answer_ids[-1] != tokenizer.eos_token_id:
+            answer_ids.append(tokenizer.eos_token_id)
+    return {
+        "prompt_input_ids": prompt_ids,
+        "answer_input_ids": answer_ids,
+        "answer_text": answer_text,
+    }
+
+
+def load_benchmark_jsonl(args, tokenizer) -> List[Dict]:
+    rows = []
+    with open(args.benchmark_jsonl, "r", encoding="utf-8") as f:
+        for line_idx, line in enumerate(f):
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            if "prompt_input_ids" in raw and "answer_input_ids" in raw:
+                row = {
+                    "prompt_input_ids": raw["prompt_input_ids"],
+                    "answer_input_ids": raw["answer_input_ids"],
+                    "answer_text": raw.get("answer_text", raw.get(args.answer_field, "")),
+                }
+            else:
+                prompt_text = raw.get(args.prompt_field)
+                answer_text = raw.get(args.answer_field)
+                if prompt_text is None or answer_text is None:
+                    split = split_prompt_answer(raw)
+                    if not split["valid"]:
+                        continue
+                    prompt_text = render_prompt(tokenizer, split["prompt_messages"])
+                    answer_text = split["answer"]
+                row = tokenize_plain_prompt_answer(str(prompt_text), str(answer_text), tokenizer, args)
+            row["benchmark_id"] = raw.get("id", raw.get("index", line_idx))
+            rows.append(row)
+    return rows
+
+
+def load_eval_rows(args, tokenizer) -> Iterable[Dict]:
+    if args.benchmark_jsonl:
+        return load_benchmark_jsonl(args, tokenizer)
+    return prepare_sprefill_sft_dataset(args, tokenizer)
+
+
 @torch.no_grad()
 def score_prompt_blocks(drafter, prompt_ids: torch.Tensor, args) -> torch.Tensor:
     device = get_model_device(drafter)
@@ -177,6 +279,24 @@ def measure_ttft(model, tokenizer, prompt_ids: torch.Tensor, args) -> float:
 
 
 @torch.no_grad()
+def generate_answer(model, tokenizer, prompt_ids: torch.Tensor, args) -> str:
+    device = get_model_device(model)
+    input_ids = prompt_ids.unsqueeze(0).to(device)
+    attention_mask = torch.ones_like(input_ids, device=device)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    output = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=args.generation_max_new_tokens,
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=pad_token_id,
+    )
+    new_tokens = output[0, input_ids.size(1):]
+    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+
+@torch.no_grad()
 def evaluate_one(idx: int, row: Dict, drafter, target, tokenizer, args) -> Dict:
     prompt_ids = torch.tensor(row["prompt_input_ids"], dtype=torch.long)
     answer_ids = torch.tensor(row["answer_input_ids"], dtype=torch.long)
@@ -209,8 +329,9 @@ def evaluate_one(idx: int, row: Dict, drafter, target, tokenizer, args) -> Dict:
     speedup_e2e = full_ttft / compressed_e2e_ttft if compressed_e2e_ttft > 0 else float("inf")
     compression_ratio = compressed_prompt.numel() / max(1, prompt_ids.numel())
 
-    return {
+    record = {
         "index": idx,
+        "benchmark_id": row.get("benchmark_id", idx),
         "prompt_tokens": int(prompt_ids.numel()),
         "compressed_prompt_tokens": int(compressed_prompt.numel()),
         "compression_ratio": compression_ratio,
@@ -227,6 +348,36 @@ def evaluate_one(idx: int, row: Dict, drafter, target, tokenizer, args) -> Dict:
         "answer_nll_delta_per_token": nll_delta,
         "retained": nll_delta <= args.retention_nll_delta_threshold,
     }
+    add_generation_metrics(
+        record,
+        target=target,
+        tokenizer=tokenizer,
+        prompt_ids=prompt_ids,
+        compressed_prompt=compressed_prompt,
+        answer_text=row.get("answer_text", ""),
+        args=args,
+    )
+    return record
+
+
+def add_generation_metrics(record: Dict, target, tokenizer, prompt_ids, compressed_prompt, answer_text, args) -> None:
+    if not args.eval_generation or not answer_text:
+        return
+    full_pred = generate_answer(target, tokenizer, prompt_ids, args)
+    compressed_pred = generate_answer(target, tokenizer, compressed_prompt.cpu(), args)
+    record.update(
+        {
+            "reference_answer": answer_text,
+            "full_prediction": full_pred,
+            "compressed_prediction": compressed_pred,
+            "full_exact_match": exact_match(full_pred, answer_text),
+            "compressed_exact_match": exact_match(compressed_pred, answer_text),
+            "full_contains_answer": contains_answer(full_pred, answer_text),
+            "compressed_contains_answer": contains_answer(compressed_pred, answer_text),
+            "full_f1": token_f1(full_pred, answer_text),
+            "compressed_f1": token_f1(compressed_pred, answer_text),
+        }
+    )
 
 
 def summarize(records: List[Dict]) -> Dict:
@@ -236,10 +387,14 @@ def summarize(records: List[Dict]) -> Dict:
     def mean(key):
         return sum(float(r[key]) for r in records) / len(records)
 
+    def mean_if_present(key):
+        values = [float(r[key]) for r in records if key in r]
+        return sum(values) / len(values) if values else None
+
     full_total = sum(float(r["full_ttft_s"]) for r in records)
     comp_total = sum(float(r["compressed_ttft_s"]) for r in records)
     comp_e2e_total = sum(float(r["compressed_e2e_ttft_s"]) for r in records)
-    return {
+    summary = {
         "num_samples": len(records),
         "avg_prompt_tokens": mean("prompt_tokens"),
         "avg_compressed_prompt_tokens": mean("compressed_prompt_tokens"),
@@ -257,13 +412,31 @@ def summarize(records: List[Dict]) -> Dict:
         "avg_answer_nll_delta_per_token": mean("answer_nll_delta_per_token"),
         "retention_rate": sum(1 for r in records if r["retained"]) / len(records),
     }
+    for key in (
+        "full_exact_match",
+        "compressed_exact_match",
+        "full_contains_answer",
+        "compressed_contains_answer",
+        "full_f1",
+        "compressed_f1",
+    ):
+        value = mean_if_present(key)
+        if value is not None:
+            summary[f"avg_{key}"] = value
+    if "avg_full_exact_match" in summary:
+        summary["exact_match_delta"] = summary["avg_compressed_exact_match"] - summary["avg_full_exact_match"]
+        summary["contains_answer_delta"] = (
+            summary["avg_compressed_contains_answer"] - summary["avg_full_contains_answer"]
+        )
+        summary["f1_delta"] = summary["avg_compressed_f1"] - summary["avg_full_f1"]
+    return summary
 
 
 def main():
     args = get_args()
     dtype = resolve_dtype(args.torch_dtype)
     tokenizer = load_tokenizer(args.tokenizer_id or args.target_model_id)
-    dataset = prepare_sprefill_sft_dataset(args, tokenizer)
+    dataset = load_eval_rows(args, tokenizer)
 
     drafter = load_drafter(args, dtype)
     target = load_target(args, dtype)

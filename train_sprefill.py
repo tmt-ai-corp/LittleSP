@@ -123,6 +123,10 @@ def get_torch_dtype(args):
     return torch.float32
 
 
+def use_bf16(args) -> bool:
+    return bool(args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+
+
 def load_student_model(args, torch_dtype):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
@@ -187,7 +191,7 @@ def make_training_args(args, save_dir):
         adam_beta1=args.adam_beta1,
         adam_beta2=args.adam_beta2,
         weight_decay=args.weight_decay,
-        bf16=args.bf16,
+        bf16=use_bf16(args),
         logging_steps=args.logging_steps,
         save_strategy="steps",
         save_steps=args.save_steps,

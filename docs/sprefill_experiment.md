@@ -120,6 +120,36 @@ Recorded metrics:
 - `retention_rate`: fraction of examples with answer NLL delta under
   `--retention_nll_delta_threshold`.
 
+For paper benchmarks, pass a JSONL file with either raw text fields or tokenized
+fields:
+
+```json
+{"id": "niah-0001", "prompt": "...long context...", "answer": "needle answer"}
+```
+
+or:
+
+```json
+{"id": "case-0001", "prompt_input_ids": [1, 2, 3], "answer_input_ids": [4, 5]}
+```
+
+Then run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python eval_sprefill.py \
+  --drafter_model_id ./outputs_sprefill/run_name \
+  --target_model_id meta-llama/Llama-2-7b-hf \
+  --benchmark_jsonl ./benchmarks/niah.jsonl \
+  --eval_generation True \
+  --generation_max_new_tokens 128 \
+  --output_jsonl ./niah_sprefill_records.jsonl \
+  --output_summary ./niah_sprefill_summary.json
+```
+
+With `--eval_generation True`, the summary also records full/compressed exact
+match, answer containment, token F1, and the corresponding compressed-minus-full
+score deltas.
+
 ## Current Scope
 
 This implementation provides the training/eval objective and a PyTorch attention

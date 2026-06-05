@@ -85,6 +85,7 @@ def get_args():
     parser.add_argument("--itq_n_iter", type=int, default=50)
 
     parser.add_argument("--attn_implementation", type=str, default="eager")
+    parser.add_argument("--allow_flex_attention", type=str2bool, default=False)
     parser.add_argument("--teacher_device_map", type=str, default="auto")
     parser.add_argument("--student_device", type=str, default=None)
 
@@ -110,6 +111,39 @@ def get_args():
     parser.add_argument("--kd_temperature", type=float, default=1.0)
 
     return parser.parse_args()
+
+
+def stabilize_attention_args(args):
+    """Resolve attention/scorer combinations that are unsafe for long-context QAT."""
+    implementation = args.attn_implementation.lower()
+
+    if implementation == "flex_attention" and not args.allow_flex_attention:
+        logger.warning(
+            "flex_attention can compile sequence-length-specific Triton kernels that exceed "
+            "the GPU shared-memory limit during QAT. Switching student attention to sdpa. "
+            "Pass --allow_flex_attention True only for an explicit kernel experiment."
+        )
+        args.attn_implementation = "sdpa"
+        implementation = "sdpa"
+
+    if args.score_source == "auto" and implementation in {
+        "flex_attention",
+        "sdpa",
+        "flash_attention_2",
+        "flash_attention_3",
+    }:
+        logger.warning(
+            f"{implementation} does not reliably expose full attention probabilities. "
+            "Using hidden_norm block scoring."
+        )
+        args.score_source = "hidden_norm"
+
+    if args.score_source == "attention" and implementation != "eager":
+        raise ValueError(
+            "--score_source attention requires --attn_implementation eager. "
+            "Use --score_source hidden_norm for sdpa/flex/flash attention."
+        )
+    return args
 
 
 def get_save_dir(args) -> str:
@@ -262,7 +296,7 @@ def save_sprefill_metadata(args, save_dir):
 
 
 def main():
-    args = get_args()
+    args = stabilize_attention_args(get_args())
     set_seed(args.seed)
     save_dir = get_save_dir(args)
     torch_dtype = get_torch_dtype(args)

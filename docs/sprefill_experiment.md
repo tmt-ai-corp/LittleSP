@@ -109,6 +109,20 @@ The deletion oracle runs variants in microbatches. Keep
 models such as Qwen3. Raising it speeds up oracle generation but increases peak
 memory. The NLL implementation converts only answer-position logits to FP32.
 
+For Qwen3 training, use SDPA with hidden-state scoring:
+
+```bash
+--attn_implementation sdpa \
+--score_source hidden_norm
+```
+
+`flex_attention` compiles sequence-length-specific Triton kernels. With variable
+SFT lengths, Qwen3, gradient checkpointing, and LittleBit QAT, some generated
+kernels can request more shared memory than the GPU provides. The training
+script therefore converts `flex_attention + auto` to `sdpa + hidden_norm` by
+default. `--allow_flex_attention True` is available only for explicit kernel
+experiments and may still fail on particular sequence lengths.
+
 ## Evaluation
 
 The eval script loads the trained LittleBit drafter, scores prompt blocks, keeps

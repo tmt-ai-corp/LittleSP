@@ -175,6 +175,50 @@ def teacher_deletion_utility(
     return utilities, utility_mask
 
 
+def normalize_attention_shape(attn: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Normalize common attention layouts to [batch, heads, query, key]."""
+    if not isinstance(attn, torch.Tensor):
+        raise TypeError(f"Expected an attention tensor, got {type(attn).__name__}.")
+
+    if attn.dim() == 5:
+        if attn.size(0) != batch_size:
+            raise ValueError(
+                f"Cannot interpret rank-5 attention shape {tuple(attn.shape)} "
+                f"for batch size {batch_size}."
+            )
+        return attn.flatten(1, 2)
+
+    if attn.dim() == 4:
+        if attn.size(0) != batch_size:
+            raise ValueError(
+                f"Cannot interpret rank-4 attention shape {tuple(attn.shape)} "
+                f"for batch size {batch_size}."
+            )
+        return attn
+
+    if attn.dim() == 3:
+        first_dim, query_len, key_len = attn.shape
+        if first_dim == batch_size:
+            # Head-aggregated attention: [batch, query, key].
+            return attn.unsqueeze(1)
+        if first_dim % batch_size == 0:
+            # Flattened heads: [batch * heads, query, key].
+            return attn.reshape(batch_size, first_dim // batch_size, query_len, key_len)
+        raise ValueError(
+            f"Cannot interpret rank-3 attention shape {tuple(attn.shape)} "
+            f"for batch size {batch_size}."
+        )
+
+    if attn.dim() == 2 and batch_size == 1:
+        # Head- and batch-aggregated attention: [query, key].
+        return attn.unsqueeze(0).unsqueeze(0)
+
+    raise ValueError(
+        f"Unsupported attention shape {tuple(attn.shape)} for batch size {batch_size}; "
+        "expected [q,k], [b,q,k], [b*h,q,k], [b,h,q,k], or [b,g,h,q,k]."
+    )
+
+
 def aggregate_attention_block_scores(
     attentions: Sequence[torch.Tensor],
     prompt_lens: torch.Tensor,
@@ -187,12 +231,21 @@ def aggregate_attention_block_scores(
     if not attentions:
         raise ValueError("Student model did not return attentions. Use eager attention and output_attentions=True.")
 
-    layer_slice = attentions[slice(layer_start, layer_end)]
+    raw_layer_slice = attentions[slice(layer_start, layer_end)]
+    if not raw_layer_slice:
+        raw_layer_slice = attentions[-1:]
+
+    prompt_lens_cpu = prompt_lens.detach().cpu().tolist()
+    batch_size = len(prompt_lens_cpu)
+    layer_slice = [
+        normalize_attention_shape(attn, batch_size=batch_size)
+        for attn in raw_layer_slice
+        if attn is not None
+    ]
     if not layer_slice:
-        layer_slice = attentions[-1:]
+        raise ValueError("Student model returned only empty attention entries.")
 
     device = layer_slice[0].device
-    prompt_lens_cpu = prompt_lens.detach().cpu().tolist()
     rows = []
     masks = []
 

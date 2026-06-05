@@ -12,6 +12,11 @@ import torch.nn.functional as F
 Block = Tuple[int, int]
 
 
+def differentiable_zero(reference: torch.Tensor) -> torch.Tensor:
+    """Return a scalar zero that preserves reference's autograd path."""
+    return reference.sum() * 0.0
+
+
 @dataclass
 class CompressionResult:
     input_ids: torch.Tensor
@@ -155,7 +160,7 @@ def teacher_deletion_utility(
         answer_ids = batch["answer_input_ids"][b_idx, :answer_len].detach().to("cpu")
         blocks = split_blocks(prompt_len, block_size)
         selected = select_evenly(len(blocks), max_oracle_blocks)
-        if not blocks or not selected or answer_ids.numel() == 0:
+        if len(selected) <= 1 or answer_ids.numel() == 0:
             continue
 
         full_ids = torch.cat([prompt_ids, answer_ids], dim=0)
@@ -400,7 +405,7 @@ def saliency_kl_loss(
 ) -> torch.Tensor:
     valid_rows = mask.sum(dim=1).gt(1)
     if not valid_rows.any():
-        return student_scores.new_zeros(())
+        return differentiable_zero(student_scores)
     s = student_scores[valid_rows].masked_fill(~mask[valid_rows], -1e9)
     u = teacher_utility[valid_rows].masked_fill(~mask[valid_rows], -1e9)
     target = F.softmax(u / temperature, dim=-1)
@@ -416,7 +421,7 @@ def pairwise_rank_loss(
 ) -> torch.Tensor:
     valid_rows = mask.sum(dim=1).gt(1)
     if not valid_rows.any():
-        return student_scores.new_zeros(())
+        return differentiable_zero(student_scores)
 
     s = student_scores[valid_rows]
     u = teacher_utility[valid_rows]
@@ -425,7 +430,7 @@ def pairwise_rank_loss(
     delta_s = s.unsqueeze(2) - s.unsqueeze(1)
     pair_mask = m.unsqueeze(2) & m.unsqueeze(1) & delta_u.abs().gt(margin)
     if not pair_mask.any():
-        return student_scores.new_zeros(())
+        return differentiable_zero(student_scores)
     target = delta_u.sign()
     weights = delta_u.abs().detach()
     loss = F.softplus(-target * delta_s) * weights
@@ -448,7 +453,7 @@ def budget_loss(
         gate = torch.sigmoid((valid - threshold) / temperature)
         losses.append((gate.mean() - keep_ratio) ** 2)
     if not losses:
-        return student_scores.new_zeros(())
+        return differentiable_zero(student_scores)
     return torch.stack(losses).mean()
 
 

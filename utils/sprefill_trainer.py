@@ -240,6 +240,12 @@ class SpecPrefillKDTrainer(Trainer):
                         hidden_mse = torch.stack(mse_terms).mean()
                         loss = loss + cfg.hidden_mse_loss_scale * hidden_mse
 
+        if not loss.requires_grad:
+            raise RuntimeError(
+                "Speculative prefill loss is detached from the student model. "
+                "Check that the selected score source depends on trainable parameters."
+            )
+
         with torch.no_grad():
             valid_util = teacher_utility[joint_mask]
             mean_utility = valid_util.mean() if valid_util.numel() else teacher_utility.new_zeros(())
@@ -253,6 +259,9 @@ class SpecPrefillKDTrainer(Trainer):
                     "loss_hidden_mse": hidden_mse.detach().float().item(),
                     "teacher_utility_mean": mean_utility.detach().float().item(),
                     "oracle_blocks_per_sample": joint_mask.sum(dim=1).float().mean().item(),
+                    "degenerate_supervision_fraction": (
+                        joint_mask.sum(dim=1).le(1).float().mean().item()
+                    ),
                     "score_source_attention": float(use_attention),
                     "student_score_nonfinite_fraction": student_nonfinite.detach().float().item(),
                 }

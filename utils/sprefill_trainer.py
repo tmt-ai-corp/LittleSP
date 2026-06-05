@@ -53,7 +53,6 @@ class SpecPrefillKDTrainer(Trainer):
         self.teacher_model.eval()
         for param in self.teacher_model.parameters():
             param.requires_grad = False
-        self.tokenizer = tokenizer
         self.loss_config = loss_config
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 

@@ -90,6 +90,8 @@ def get_args():
 
     parser.add_argument("--block_size", type=int, default=128)
     parser.add_argument("--max_oracle_blocks", type=int, default=16)
+    parser.add_argument("--oracle_microbatch_size", type=int, default=1)
+    parser.add_argument("--score_source", type=str, default="auto", choices=["auto", "attention", "hidden_norm"])
     parser.add_argument("--score_query_tokens", type=int, default=128)
     parser.add_argument("--score_layer_start", type=int, default=None)
     parser.add_argument("--score_layer_end", type=int, default=None)
@@ -219,6 +221,8 @@ def build_loss_config(args) -> SpecPrefillLossConfig:
     return SpecPrefillLossConfig(
         block_size=args.block_size,
         max_oracle_blocks=args.max_oracle_blocks,
+        oracle_microbatch_size=args.oracle_microbatch_size,
+        score_source=args.score_source,
         score_query_tokens=args.score_query_tokens,
         score_layer_start=args.score_layer_start,
         score_layer_end=args.score_layer_end,

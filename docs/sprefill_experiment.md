@@ -62,6 +62,8 @@ CUDA_VISIBLE_DEVICES=0 python train_sprefill.py \
   --block_size 128 \
   --keep_ratio 0.05 \
   --max_oracle_blocks 16 \
+  --oracle_microbatch_size 1 \
+  --score_source auto \
   --rank_loss_scale 1.0 \
   --pairwise_loss_scale 0.25 \
   --budget_loss_scale 0.05 \
@@ -85,9 +87,27 @@ Useful ablations:
 # Increase oracle density
 --max_oracle_blocks 32
 
+# Trade memory for faster teacher-oracle generation
+--oracle_microbatch_size 2
+
+# Force a scorer for an ablation
+--score_source attention
+--score_source hidden_norm
+
 # Change scoring query window
 --score_query_tokens 256
 ```
+
+`--score_source auto` validates that the model's `output_attentions` tensors are
+finite attention probabilities. Some Qwen3/Transformers combinations return a
+3-D hidden-state-like tensor in that slot. In that case, training automatically
+falls back to differentiable hidden-state block scores instead of producing NaN
+block means.
+
+The deletion oracle runs variants in microbatches. Keep
+`--oracle_microbatch_size 1` for the lowest memory use with large-vocabulary
+models such as Qwen3. Raising it speeds up oracle generation but increases peak
+memory. The NLL implementation converts only answer-position logits to FP32.
 
 ## Evaluation
 

@@ -20,6 +20,8 @@ from utils.sprefill_data import (
 )
 from utils.sprefill_losses import (
     aggregate_attention_block_scores,
+    aggregate_hidden_block_scores,
+    attention_looks_like_probabilities,
     answer_nll,
     compress_prompt_by_blocks,
     cuda_time_call,
@@ -69,6 +71,7 @@ def get_args():
     parser.add_argument("--sink_tokens", type=int, default=256)
     parser.add_argument("--window_tokens", type=int, default=512)
     parser.add_argument("--score_query_tokens", type=int, default=128)
+    parser.add_argument("--score_source", type=str, default="auto", choices=["auto", "attention", "hidden_norm"])
     parser.add_argument("--score_layer_start", type=int, default=None)
     parser.add_argument("--score_layer_end", type=int, default=None)
     parser.add_argument("--score_aggregation", type=str, default="max_mean", choices=["max_mean", "mean", "last_mean"])
@@ -254,17 +257,36 @@ def score_prompt_blocks(drafter, prompt_ids: torch.Tensor, args) -> torch.Tensor
         input_ids=prompt,
         attention_mask=attention,
         use_cache=False,
-        output_attentions=True,
+        output_attentions=args.score_source != "hidden_norm",
+        output_hidden_states=args.score_source != "attention",
     )
-    scores, _ = aggregate_attention_block_scores(
-        outputs.attentions,
-        prompt_lens=torch.tensor([prompt_ids.numel()], device=device),
-        block_size=args.block_size,
-        score_query_tokens=args.score_query_tokens,
-        layer_start=args.score_layer_start,
-        layer_end=args.score_layer_end,
-        aggregation=args.score_aggregation,
-    )
+    prompt_lens = torch.tensor([prompt_ids.numel()], device=device)
+    use_attention = args.score_source == "attention"
+    if args.score_source == "auto":
+        use_attention = attention_looks_like_probabilities(
+            getattr(outputs, "attentions", None) or (),
+            batch_size=1,
+            max_prompt_len=prompt_ids.numel(),
+        )
+    if use_attention:
+        scores, _ = aggregate_attention_block_scores(
+            outputs.attentions,
+            prompt_lens=prompt_lens,
+            block_size=args.block_size,
+            score_query_tokens=args.score_query_tokens,
+            layer_start=args.score_layer_start,
+            layer_end=args.score_layer_end,
+            aggregation=args.score_aggregation,
+        )
+    else:
+        scores, _ = aggregate_hidden_block_scores(
+            outputs.hidden_states,
+            prompt_lens=prompt_lens,
+            block_size=args.block_size,
+            layer_start=args.score_layer_start,
+            layer_end=args.score_layer_end,
+            aggregation=args.score_aggregation,
+        )
     return scores[0].detach().cpu()
 
 

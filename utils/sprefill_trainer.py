@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -7,6 +8,8 @@ from transformers import Trainer
 
 from utils.sprefill_losses import (
     aggregate_attention_block_scores,
+    aggregate_hidden_block_scores,
+    attention_looks_like_probabilities,
     answer_kl,
     budget_loss,
     get_model_device,
@@ -16,15 +19,19 @@ from utils.sprefill_losses import (
     teacher_deletion_utility,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SpecPrefillLossConfig:
     block_size: int = 128
     max_oracle_blocks: int = 16
+    oracle_microbatch_size: int = 1
     score_query_tokens: int = 128
     score_layer_start: Optional[int] = None
     score_layer_end: Optional[int] = None
     score_aggregation: str = "max_mean"
+    score_source: str = "auto"
     keep_ratio: float = 0.05
     saliency_temperature: float = 0.1
     budget_temperature: float = 0.1
@@ -55,6 +62,7 @@ class SpecPrefillKDTrainer(Trainer):
             param.requires_grad = False
         self.loss_config = loss_config
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        self._warned_attention_fallback = False
 
     @staticmethod
     def _move_tensor_inputs(inputs: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -93,6 +101,7 @@ class SpecPrefillKDTrainer(Trainer):
             block_size=cfg.block_size,
             pad_token_id=self.pad_token_id,
             max_oracle_blocks=cfg.max_oracle_blocks,
+            oracle_microbatch_size=cfg.oracle_microbatch_size,
             clamp_min=cfg.utility_clamp_min,
             return_device=inputs["input_ids"].device,
         )
@@ -101,17 +110,47 @@ class SpecPrefillKDTrainer(Trainer):
             input_ids=inputs["prompt_input_ids"],
             attention_mask=inputs["prompt_attention_mask"],
             use_cache=False,
-            output_attentions=True,
+            output_attentions=cfg.score_source != "hidden_norm",
+            output_hidden_states=cfg.score_source != "attention",
         )
-        student_scores, score_mask = aggregate_attention_block_scores(
-            prompt_outputs.attentions,
-            prompt_lens=inputs["prompt_lens"],
-            block_size=cfg.block_size,
-            score_query_tokens=cfg.score_query_tokens,
-            layer_start=cfg.score_layer_start,
-            layer_end=cfg.score_layer_end,
-            aggregation=cfg.score_aggregation,
-        )
+
+        use_attention = cfg.score_source == "attention"
+        if cfg.score_source == "auto":
+            use_attention = attention_looks_like_probabilities(
+                getattr(prompt_outputs, "attentions", None) or (),
+                batch_size=inputs["prompt_input_ids"].size(0),
+                max_prompt_len=int(inputs["prompt_lens"].max().item()),
+            )
+            if not use_attention and not self._warned_attention_fallback:
+                logger.warning(
+                    "Student attention output is non-finite or does not look like attention "
+                    "probabilities; falling back to hidden-state block scoring."
+                )
+                self._warned_attention_fallback = True
+
+        if use_attention:
+            student_scores, score_mask = aggregate_attention_block_scores(
+                prompt_outputs.attentions,
+                prompt_lens=inputs["prompt_lens"],
+                block_size=cfg.block_size,
+                score_query_tokens=cfg.score_query_tokens,
+                layer_start=cfg.score_layer_start,
+                layer_end=cfg.score_layer_end,
+                aggregation=cfg.score_aggregation,
+            )
+        else:
+            student_scores, score_mask = aggregate_hidden_block_scores(
+                prompt_outputs.hidden_states,
+                prompt_lens=inputs["prompt_lens"],
+                block_size=cfg.block_size,
+                layer_start=cfg.score_layer_start,
+                layer_end=cfg.score_layer_end,
+                aggregation=cfg.score_aggregation,
+            )
+
+        student_nonfinite = (~torch.isfinite(student_scores[score_mask])).float().mean()
+        student_scores = torch.nan_to_num(student_scores, nan=0.0, posinf=1e4, neginf=-1e4)
+        teacher_utility = torch.nan_to_num(teacher_utility, nan=0.0, posinf=1e4, neginf=0.0)
 
         dim = min(student_scores.size(1), teacher_utility.size(1))
         student_scores = student_scores[:, :dim]
@@ -214,6 +253,8 @@ class SpecPrefillKDTrainer(Trainer):
                     "loss_hidden_mse": hidden_mse.detach().float().item(),
                     "teacher_utility_mean": mean_utility.detach().float().item(),
                     "oracle_blocks_per_sample": joint_mask.sum(dim=1).float().mean().item(),
+                    "score_source_attention": float(use_attention),
+                    "student_score_nonfinite_fraction": student_nonfinite.detach().float().item(),
                 }
             )
 

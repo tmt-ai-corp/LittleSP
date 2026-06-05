@@ -58,17 +58,26 @@ def answer_nll(
         attention_mask=attention_mask,
         use_cache=False,
     )
-    logits = _outputs_logits(outputs).float()
-    shift_logits = logits[:, :-1, :].contiguous()
+    logits = _outputs_logits(outputs)
+    shift_logits = logits[:, :-1, :]
     shift_labels = labels[:, 1:].contiguous()
-    losses = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index=-100,
-        reduction="none",
-    ).view(shift_labels.shape)
     mask = shift_labels.ne(-100)
-    return (losses * mask).sum(dim=1), mask.sum(dim=1).clamp_min(1)
+    nlls = []
+    counts = []
+    for sample_logits, sample_labels, sample_mask in zip(shift_logits, shift_labels, mask):
+        selected_logits = sample_logits[sample_mask].float()
+        selected_labels = sample_labels[sample_mask]
+        count = selected_labels.numel()
+        if count:
+            nll = F.cross_entropy(selected_logits, selected_labels, reduction="sum")
+        else:
+            nll = selected_logits.new_zeros(())
+        nlls.append(nll)
+        counts.append(count)
+    return (
+        torch.stack(nlls),
+        torch.tensor(counts, dtype=torch.long, device=logits.device).clamp_min(1),
+    )
 
 
 def student_answer_ce(student_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -127,6 +136,7 @@ def teacher_deletion_utility(
     block_size: int,
     pad_token_id: int,
     max_oracle_blocks: Optional[int] = 16,
+    oracle_microbatch_size: int = 1,
     clamp_min: float = 0.0,
     return_device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -163,8 +173,19 @@ def teacher_deletion_utility(
             variant_ids.append(ids)
             variant_labels.append(labels)
 
-        ids, attention, labels = _pad_variants(variant_ids, variant_labels, pad_token_id, teacher_device)
-        nll, _ = answer_nll(teacher_model, ids, attention, labels)
+        nll_chunks = []
+        microbatch_size = max(1, int(oracle_microbatch_size))
+        for start in range(0, len(variant_ids), microbatch_size):
+            ids, attention, labels = _pad_variants(
+                variant_ids[start:start + microbatch_size],
+                variant_labels[start:start + microbatch_size],
+                pad_token_id,
+                teacher_device,
+            )
+            chunk_nll, _ = answer_nll(teacher_model, ids, attention, labels)
+            nll_chunks.append(chunk_nll.detach().cpu())
+            del ids, attention, labels, chunk_nll
+        nll = torch.cat(nll_chunks, dim=0)
         base = nll[0]
         deltas = (nll[1:] - base).float().clamp_min(clamp_min)
 
@@ -173,6 +194,32 @@ def teacher_deletion_utility(
             utility_mask[b_idx, block_idx] = True
 
     return utilities, utility_mask
+
+
+def attention_looks_like_probabilities(
+    attentions: Sequence[torch.Tensor],
+    batch_size: int,
+    max_prompt_len: int,
+) -> bool:
+    """Cheaply reject hidden-state-like or non-finite tensors mislabeled as attention."""
+    for raw_attn in reversed(attentions):
+        if raw_attn is None:
+            continue
+        try:
+            attn = normalize_attention_shape(raw_attn, batch_size=batch_size)
+        except (TypeError, ValueError):
+            return False
+        if attn.size(-2) < max_prompt_len or attn.size(-1) < max_prompt_len:
+            return False
+        query_count = min(4, max_prompt_len)
+        sample = attn[0, 0, max_prompt_len - query_count:max_prompt_len, :max_prompt_len].detach().float()
+        if sample.numel() == 0 or not torch.isfinite(sample).all():
+            return False
+        if sample.min() < -1e-4 or sample.max() > 2.0:
+            return False
+        row_sums = sample.sum(dim=-1)
+        return bool(((row_sums > 0.1) & (row_sums < 2.0)).all().item())
+    return False
 
 
 def normalize_attention_shape(attn: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -264,19 +311,30 @@ def aggregate_attention_block_scores(
         if aggregation == "mean":
             layer_token_scores = []
             for attn in layer_slice:
-                part = attn[batch_idx, :, q_start:q_end, :prompt_len].float()
+                part = torch.nan_to_num(
+                    attn[batch_idx, :, q_start:q_end, :prompt_len].float()
+                )
                 layer_token_scores.append(part.mean(dim=(0, 1)))
             token_scores = torch.stack(layer_token_scores, dim=0).mean(dim=0)
         elif aggregation == "last_mean":
-            part = layer_slice[-1][batch_idx, :, q_start:q_end, :prompt_len].float()
+            part = torch.nan_to_num(
+                layer_slice[-1][batch_idx, :, q_start:q_end, :prompt_len].float()
+            )
             token_scores = part.mean(dim=(0, 1))
         else:
             per_layer = []
             for attn in layer_slice:
-                part = attn[batch_idx, :, q_start:q_end, :prompt_len].float()
+                part = torch.nan_to_num(
+                    attn[batch_idx, :, q_start:q_end, :prompt_len].float()
+                )
                 per_layer.append(part.amax(dim=0))
             token_scores = torch.stack(per_layer, dim=0).amax(dim=0).mean(dim=0)
 
+        if token_scores.numel() < prompt_len:
+            raise ValueError(
+                f"Attention key dimension {token_scores.numel()} is shorter than prompt length "
+                f"{prompt_len}; the model likely returned hidden states instead of attention probabilities."
+            )
         block_scores = [token_scores[start:end].mean() for start, end in blocks]
         rows.append(torch.stack(block_scores))
         masks.append(torch.ones(len(block_scores), dtype=torch.bool, device=device))
@@ -289,6 +347,49 @@ def aggregate_attention_block_scores(
         padded_rows.append(F.pad(row, (0, pad), value=-1e9))
         padded_masks.append(F.pad(mask, (0, pad), value=False))
     return torch.stack(padded_rows), torch.stack(padded_masks)
+
+
+def aggregate_hidden_block_scores(
+    hidden_states: Sequence[torch.Tensor],
+    prompt_lens: torch.Tensor,
+    block_size: int,
+    layer_start: Optional[int] = None,
+    layer_end: Optional[int] = None,
+    aggregation: str = "mean",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not hidden_states:
+        raise ValueError("Student model did not return hidden states.")
+
+    layer_slice = hidden_states[slice(layer_start, layer_end)]
+    if not layer_slice:
+        layer_slice = hidden_states[-1:]
+
+    device = layer_slice[0].device
+    rows = []
+    masks = []
+    for batch_idx, prompt_len in enumerate(prompt_lens.detach().cpu().tolist()):
+        blocks = split_blocks(prompt_len, block_size)
+        per_layer = []
+        for hidden in layer_slice:
+            values = torch.nan_to_num(hidden[batch_idx, :prompt_len].float())
+            per_layer.append(values.square().mean(dim=-1).clamp_min(1e-12).sqrt())
+        stacked = torch.stack(per_layer, dim=0)
+        if aggregation == "last_mean":
+            token_scores = stacked[-1]
+        elif aggregation == "max_mean":
+            token_scores = stacked.amax(dim=0)
+        else:
+            token_scores = stacked.mean(dim=0)
+
+        block_scores = [token_scores[start:end].mean() for start, end in blocks]
+        rows.append(torch.stack(block_scores))
+        masks.append(torch.ones(len(block_scores), dtype=torch.bool, device=device))
+
+    max_blocks = max(row.numel() for row in rows)
+    return (
+        torch.stack([F.pad(row, (0, max_blocks - row.numel()), value=-1e9) for row in rows]),
+        torch.stack([F.pad(mask, (0, max_blocks - mask.numel()), value=False) for mask in masks]),
+    )
 
 
 def saliency_kl_loss(

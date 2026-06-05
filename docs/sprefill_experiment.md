@@ -116,6 +116,26 @@ For Qwen3 training, use SDPA with hidden-state scoring:
 --score_source hidden_norm
 ```
 
+For multi-GPU Qwen3 training, use the SpecPrefill-specific ZeRO-1 config and
+rank-consistent last-layer scoring:
+
+```bash
+deepspeed --num_gpus=4 train_sprefill.py \
+  ... \
+  --ds_config_path configs/zero_sprefill.json \
+  --teacher_device_map local \
+  --attn_implementation sdpa \
+  --score_source hidden_norm \
+  --score_aggregation last_mean
+```
+
+The generic `configs/zero.json` uses ZeRO-2 gradient partitioning with
+overlapped reduction. SpecPrefill's data-dependent scoring graph can make its
+gradient buckets differ across ranks, causing a first-step NCCL collective
+timeout. The dedicated config uses a non-overlapped ZeRO-1 reduction path.
+Each distributed process also keeps its frozen teacher on its local-rank GPU;
+do not use `teacher_device_map=auto` for this data-parallel setup.
+
 `flex_attention` compiles sequence-length-specific Triton kernels. With variable
 SFT lengths, Qwen3, gradient checkpointing, and LittleBit QAT, some generated
 kernels can request more shared memory than the GPU provides. The training

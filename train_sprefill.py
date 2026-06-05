@@ -86,7 +86,7 @@ def get_args():
 
     parser.add_argument("--attn_implementation", type=str, default="eager")
     parser.add_argument("--allow_flex_attention", type=str2bool, default=False)
-    parser.add_argument("--teacher_device_map", type=str, default="auto")
+    parser.add_argument("--teacher_device_map", type=str, default="local")
     parser.add_argument("--student_device", type=str, default=None)
 
     parser.add_argument("--block_size", type=int, default=128)
@@ -116,6 +116,7 @@ def get_args():
 def stabilize_attention_args(args):
     """Resolve attention/scorer combinations that are unsafe for long-context QAT."""
     implementation = args.attn_implementation.lower()
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     if implementation == "flex_attention" and not args.allow_flex_attention:
         logger.warning(
@@ -142,6 +143,34 @@ def stabilize_attention_args(args):
         raise ValueError(
             "--score_source attention requires --attn_implementation eager. "
             "Use --score_source hidden_norm for sdpa/flex/flash attention."
+        )
+
+    if world_size > 1 and args.score_source == "hidden_norm" and args.score_aggregation == "max_mean":
+        logger.warning(
+            "Distributed hidden_norm scoring with max_mean creates data-dependent layer paths. "
+            "Using last_mean so every rank reduces the same gradient graph."
+        )
+        args.score_aggregation = "last_mean"
+    return args
+
+
+def validate_distributed_args(args):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1 or not args.ds_config_path:
+        return args
+
+    try:
+        with open(args.ds_config_path, "r", encoding="utf-8") as f:
+            ds_config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return args
+
+    zero = ds_config.get("zero_optimization", {})
+    if zero.get("stage") == 2 and zero.get("overlap_comm", False):
+        raise ValueError(
+            "Distributed SpecPrefill is incompatible with ZeRO-2 overlap_comm because its "
+            "data-dependent gradient buckets can differ across ranks. Use "
+            "--ds_config_path configs/zero_sprefill.json."
         )
     return args
 
@@ -207,12 +236,22 @@ def load_student_model(args, torch_dtype):
 
 def load_teacher_model(args, torch_dtype):
     teacher_id = args.teacher_model_id or args.model_id
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = args.local_rank if args.local_rank >= 0 else int(os.environ.get("LOCAL_RANK", "0"))
+    placement = args.teacher_device_map.lower()
+    if world_size > 1 and placement == "auto":
+        logger.warning(
+            "teacher_device_map=auto can place multiple distributed teachers on the same GPU. "
+            f"Using local rank cuda:{local_rank} instead."
+        )
+        placement = "local"
+
     kwargs = {
         "torch_dtype": torch_dtype,
         "low_cpu_mem_usage": True,
         "trust_remote_code": True,
     }
-    if args.teacher_device_map and args.teacher_device_map.lower() != "none":
+    if placement not in {"local", "none"}:
         kwargs["device_map"] = args.teacher_device_map
     model = AutoModelForCausalLM.from_pretrained(teacher_id, **kwargs)
     model.eval()
@@ -220,7 +259,7 @@ def load_teacher_model(args, torch_dtype):
     for param in model.parameters():
         param.requires_grad = False
     if "device_map" not in kwargs and torch.cuda.is_available():
-        model.to(torch.device("cuda"))
+        model.to(torch.device(f"cuda:{local_rank}"))
     return model
 
 
@@ -296,7 +335,9 @@ def save_sprefill_metadata(args, save_dir):
 
 
 def main():
-    args = stabilize_attention_args(get_args())
+    args = validate_distributed_args(stabilize_attention_args(get_args()))
+    if args.local_rank >= 0 and torch.cuda.is_available():
+        torch.cuda.set_device(args.local_rank)
     set_seed(args.seed)
     save_dir = get_save_dir(args)
     torch_dtype = get_torch_dtype(args)
